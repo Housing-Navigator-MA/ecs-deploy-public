@@ -655,7 +655,8 @@ class RollOut
             enable: true,
             rollback: true,
           },
-        }
+        },
+        enable_execute_command: true,
       }
 
       if load_balancers.length > 0
@@ -683,6 +684,7 @@ class RollOut
         },
         #launch_type: 'EC2',
         # placement_constraints: placement_constraints,
+        enable_execute_command: true,
         placement_strategy: _placement_strategy,
         load_balancers: load_balancers,
       }
