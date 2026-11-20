@@ -232,13 +232,13 @@ class Deployer
   def _check_secrets!
     if secrets_arn.nil?
       puts "Please specify a secrets arn in your secret.deploy.values.yml file"
-      exit
+      exit 1
     end
 
     secretsmanager.describe_secret(secret_id: secrets_arn)
   rescue Aws::SecretsManager::Errors::ResourceNotFoundException
     puts "Cannot find #{secrets_arn}. Aborting"
-    exit
+    exit 1
   end
 
   def _set_image_tag!

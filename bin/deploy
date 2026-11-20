@@ -11,4 +11,7 @@ args.deployments.each do |deployment|
   Deployer.new(**deployment).run!
 end
 
-EcsTools.new.poll_state_until_stable!(CommandArgs.cluster)
+EcsTools.new.poll_state_until_stable!(
+  CommandArgs.cluster,
+  expected_task_definitions: RollOut.expected_task_definitions,
+)
