@@ -51,6 +51,16 @@ class RollOut
 
   NOT_SPOT = 'not-spot'
 
+  # How long to wait for a one-off task (e.g. deploy tasks/migrations) to stop
+  TASK_STOP_TIMEOUT_SECONDS = 30 * 60
+  TASK_STOP_POLL_SECONDS = 15
+
+  # Service name => task definition ARN registered for it during this deploy.
+  # Used after services settle to detect circuit-breaker rollbacks.
+  def self.expected_task_definitions
+    @expected_task_definitions ||= {}
+  end
+
   def initialize(image_base:, target_group_name:, target_group_arn:, secrets_arn:, execution_role:, task_role: nil, dj_options: nil, web_options:, fqdn:, system_status_path: 'system_status/details', versions: {}, capacity_provider:)
     self.cluster             = ENV.fetch('AWS_CLUSTER') { ENV.fetch('AWS_PROFILE') { ENV.fetch('AWS_VAULT') } }
     self.image_base          = image_base
@@ -74,7 +84,7 @@ class RollOut
     # Comment this out if you want to bypass checking on deploy task completion
     if _get_status == {} && ! ENV['FIRST'] == 'true'
       puts "Status uri #{self.status_uri} isn't correct"
-      exit
+      exit 1
     end
 
     if target_group_name.match?(/production/)
@@ -477,7 +487,7 @@ class RollOut
 
     if task_arn.nil?
       puts "[FATAL] Something went wrong with the task. exiting"
-      exit
+      exit 1
     end
 
     puts "[INFO] Task arn: #{task_arn || 'unknown'}"
@@ -497,20 +507,64 @@ class RollOut
 
     if results.failures.length > 0
       puts "[FATAL] failures: #{results.failures}"
-      exit
+      exit 1
     end
 
     failure_reasons = results.tasks.flat_map { |x| x.containers.map { |c| c.reason } }.compact
 
     if failure_reasons.length > 0
-      puts "[FATAL] failures: #{failures_reasons}"
-      exit
+      puts "[FATAL] failures: #{failure_reasons}"
+      exit 1
     end
 
     task_id = task_arn.split('/').last
     log_stream_name.sub!(/TASK_ID/, task_id)
 
     _tail_logs(start_time)
+
+    _require_successful_task_exit!(task_arn)
+  end
+
+  # Waits for a one-off task to stop and requires every container to have
+  # exited with code 0. Exits the deploy with status 1 otherwise.
+  def _require_successful_task_exit!(task_arn)
+    puts "[INFO] Waiting for the task to stop (up to #{TASK_STOP_TIMEOUT_SECONDS / 60} minutes)"
+
+    begin
+      ecs.wait_until(
+        :tasks_stopped,
+        { cluster: cluster, tasks: [task_arn] },
+        { max_attempts: TASK_STOP_TIMEOUT_SECONDS / TASK_STOP_POLL_SECONDS, delay: TASK_STOP_POLL_SECONDS },
+      )
+    rescue Aws::Waiters::Errors::WaiterFailed => e
+      puts "[FATAL] The task did not stop within #{TASK_STOP_TIMEOUT_SECONDS / 60} minutes (#{e.message})"
+      puts "[FATAL] It may still be running. Task arn: #{task_arn}"
+      puts "[FATAL] Logs: #{target_group_name}/#{log_stream_name}"
+      exit 1
+    end
+
+    task = ecs.describe_tasks(cluster: cluster, tasks: [task_arn]).tasks.first
+
+    if task.nil?
+      puts "[FATAL] Could not describe the task after it stopped. Task arn: #{task_arn}"
+      exit 1
+    end
+
+    failed_containers = task.containers.reject { |c| c.exit_code == 0 }
+
+    if failed_containers.empty?
+      puts "[INFO] Task finished with exit code 0"
+      return
+    end
+
+    puts "[FATAL] The task failed. Stopping the deploy so new code is not rolled out."
+    puts "[FATAL] Stop reason: #{task.stopped_reason || 'unknown'}"
+    failed_containers.each do |c|
+      puts "[FATAL] Container #{c.name}: exit code #{c.exit_code.nil? ? 'none' : c.exit_code}#{c.reason ? " (#{c.reason})" : ''}"
+    end
+    puts "[FATAL] Logs: #{target_group_name}/#{log_stream_name}"
+    puts "[FATAL] Task arn: #{task_arn}"
+    exit 1
   end
 
   def _get_status
@@ -520,55 +574,13 @@ class RollOut
     {}
   end
 
-  # tailing the logs until we see "---DONE---" isn't reliable because we don't
-  # know how long to wait for sure. We consider it complete if we saw
-  # ---DONE--- or if the task executed the rake task that updates the
-  # deployment ID
+  # _run_task! now waits for the task to stop and exits the deploy unless
+  # every container exited with code 0, so reaching this point means the
+  # deploy tasks succeeded. (Previously this polled the app's status endpoint
+  # and offered to proceed anyway, which could roll out new code on an
+  # un-migrated database.)
   def _poll_until_deploy_tasks_complete!
-    complete = false
-    while !complete
-      response = _get_status
-      complete = (response.dig('registered_deployment_id') == self.deployment_id)
-
-      if complete || self.last_task_completed
-        puts "[INFO] Looks like the deployment tasks ran to completion (#{self.deployment_id})"
-        complete = true
-      else
-        puts '[WARN] Looks like the deployment task isn\'t done.'
-        puts "[WARN] We expected: #{self.deployment_id}"
-        puts "[WARN] We got: #{response.dig('registered_deployment_id')}"
-        puts "[WARN] You can safely (p)roceed if this is the first deployment"
-        print "\nYou can (w)ait, (p)roceed with deployment anyway, (v)iew log tail, or (a)bort: "
-        response = STDIN.gets
-        if response.downcase.match(/w/)
-          puts "[INFO] Waiting 30 seconds"
-          sleep 30
-        elsif response.downcase.match(/p/)
-          puts "[WARN] Continuing on anyway"
-          complete = true
-        elsif response.downcase.match(/a/)
-          puts "[WARN] exiting"
-          exit
-        elsif response.downcase.match(/v/)
-          begin
-            resp = cwl.get_log_events({
-              log_group_name: target_group_name,
-              log_stream_name: log_stream_name,
-              start_from_head: true,
-            })
-            resp.events.each do |event|
-              puts "[TASK] #{event.message}"
-            end
-          rescue Aws::CloudWatchLogs::Errors::ResourceNotFoundException
-            puts "[INFO] Waiting 30 seconds since the log stream couldn't be found"
-            sleep 30
-          end
-        else
-          puts "[INFO] Waiting 30 seconds since we didn't understand your response"
-          sleep 30
-        end
-      end
-    end
+    puts "[INFO] Deployment tasks ran to completion"
   end
 
   # If you can construct or query for the log stream name, you can use this to
@@ -664,6 +676,7 @@ class RollOut
       end
 
       ecs.update_service(payload)
+      RollOut.expected_task_definitions[name] = task_definition
     else
       puts "[INFO] Creating #{name}"
       payload = {
@@ -694,6 +707,7 @@ class RollOut
       end
 
       ecs.create_service(payload)
+      RollOut.expected_task_definitions[name] = task_definition
     end
   end
 

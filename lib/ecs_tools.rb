@@ -37,7 +37,7 @@ class EcsTools
     exec("awslogs get #{group} ALL --watch")
   end
 
-  def poll_state_until_stable!(cluster, failures: false)
+  def poll_state_until_stable!(cluster, failures: false, expected_task_definitions: {})
     puts 'These are only services, not tasks (e.g. migrations won\'t appear here)'
     puts 'PRIMARY: The most recently pushed task definition. These are the desired things we want or are deployed'
     puts 'ACTIVE: This is what\'s currently running and will show up when we have not yet transfered all the containers to be primary'
@@ -113,6 +113,35 @@ class EcsTools
 
       sleep 20 if bad
     end
+
+    _exit_if_rolled_back!(services, expected_task_definitions)
+  end
+
+  # A service that the ECS deployment circuit breaker rolled back settles on
+  # its previous task definition and otherwise looks healthy above. Compare
+  # what is running with what this deploy registered.
+  def _exit_if_rolled_back!(services, expected_task_definitions)
+    return if expected_task_definitions.nil? || expected_task_definitions.empty?
+
+    rolled_back = []
+
+    expected_task_definitions.each do |service_name, expected_arn|
+      service = services.find { |s| s.service_name == service_name }
+      next if service.nil?
+
+      running_arn = service.deployments.first&.task_definition || service.task_definition
+      next if running_arn == expected_arn
+
+      running = running_arn.to_s.split(/:/).last
+      expected = expected_arn.to_s.split(/:/).last
+      puts "[FATAL] ROLLED BACK: #{service_name} is running revision #{running}, expected #{expected}"
+      rolled_back << service_name
+    end
+
+    return if rolled_back.empty?
+
+    puts "[FATAL] #{rolled_back.length} service(s) were rolled back. Check the ECS service events for the reason."
+    exit 1
   end
 
   # https://docs.aws.amazon.com/AmazonECS/latest/developerguide/agent-update-ecs-ami.html
